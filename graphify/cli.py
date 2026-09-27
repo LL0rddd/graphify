@@ -747,6 +747,9 @@ _COMMAND_WRAPPERS = frozenset({
     "xargs", "timeout", "stdbuf", "doas",
 })
 _HEREDOC_OPEN_RE = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
+# `NAME=value` command prefix. Matched on the whole token: the value may contain
+# `/` (`PATH=/usr/bin grep ...`), so looking only after the last `/` misses it.
+_ASSIGN_PREFIX_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
 def _bash_invokes_search(cmd_str: str) -> bool:
@@ -790,7 +793,7 @@ def _bash_invokes_search(cmd_str: str) -> bool:
         i = 0
         while i < len(tokens):
             tok = tokens[i]
-            if "=" in tok.split("/")[-1] and not tok.startswith(("-", "/")):
+            if _ASSIGN_PREFIX_RE.match(tok):
                 i += 1  # VAR=value prefix
                 continue
             name = tok.replace("\\", "/").rsplit("/", 1)[-1].lower()
@@ -867,6 +870,24 @@ def _run_hook_guard(kind: str, strict: bool = False) -> None:
             is_grep_tool = not cmd_str and bool(t.get("pattern"))
             is_bash_search = bool(cmd_str) and _bash_invokes_search(cmd_str)
             if (is_grep_tool or is_bash_search) and out_path("graph.json").is_file():
+                # #3882: like the read arm's #1840 (a) gate, stay quiet when the
+                # search provably touches only paths outside the project root.
+                # Any failure in the gate falls through to the nudge.
+                quiet = False
+                try:
+                    from graphify.hook_search_gate import (
+                        bash_searches_only_out_of_project,
+                        grep_tool_path_out_of_project,
+                    )
+                    root = Path(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()).resolve()
+                    if is_grep_tool:
+                        quiet = grep_tool_path_out_of_project(t, root, _is_cwd_relative)
+                    else:
+                        quiet = bash_searches_only_out_of_project(cmd_str, root)
+                except Exception:
+                    quiet = False
+                if quiet:
+                    return
                 sys.stdout.write(_SEARCH_NUDGE)
         elif kind == "read":
             vals = [str(t.get("file_path") or ""), str(t.get("pattern") or ""), str(t.get("path") or "")]
