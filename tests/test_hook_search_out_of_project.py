@@ -89,6 +89,8 @@ def _bash(command):
     "ls {E} | grep READ",                   # lists an outside directory
     "stat app/models.py; grep foo {E}/README.md",  # metadata only, like find -newer
     "du -sh app; grep foo {E}/README.md",
+    "date -u; grep foo {E}/README.md",                   # options that read nothing
+    "printf '%s' x; grep foo {E}/README.md",
 ])
 def test_out_of_project_search_is_quiet(template, layout, monkeypatch):
     project, elsewhere = layout
@@ -168,6 +170,15 @@ def test_grep_tool_with_out_of_project_path_is_quiet(layout, monkeypatch):
     "cat app/models.py; grep foo {E}/README.md",      # reads project code in the same line
     "file -C -m app/models.py; grep foo {E}/README.md",  # `file` is not read-only
     "tr a b < app/models.py | grep foo {E}/README.md",   # `<` is a read for every command
+    "tr a b <>app/models.py | grep foo {E}/README.md",   # `<>` opens read-write
+    "< app/models.py; grep foo {E}/README.md",           # redirection without a command
+    "cd < app/models.py; grep foo {E}/README.md",
+    "du -X app/models.py; grep foo {E}/README.md",       # GNU du reads the exclude file
+    "du -sX app/models.py {E}; grep foo {E}/README.md",
+    "du --files0-from=app/models.py; grep foo {E}/README.md",
+    "du --exclude-f=app/models.py {E}; grep foo {E}/README.md",  # abbreviated long option
+    "date -f app/models.py; grep foo {E}/README.md",     # GNU date reads dates from a file
+    'D={E}/README.md; printf -v D app/models.py; grep foo "$D"',  # printf -v assigns
 ])
 def test_search_that_can_touch_the_project_nudges(template, layout, monkeypatch):
     project, elsewhere = layout

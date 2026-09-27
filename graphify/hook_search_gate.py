@@ -131,6 +131,14 @@ _NON_READERS = frozenset({
     "whoami", "id", "uname", "which", "test", "[", "stat", "du",
 })
 _READ_ONLY = _FILE_READERS | _NON_READERS
+# ...except these options, which read a file (GNU `date -f`, GNU `du -X`/
+# `--exclude-from`/`--files0-from`) or assign a shell variable (bash `printf -v`).
+# Long options match by prefix, as GNU getopt accepts abbreviations.
+_NON_READER_UNSAFE = {
+    "date": ("f", ("--file",)),
+    "du": ("X", ("--exclude-from", "--files0-from")),
+    "printf": ("v", ()),
+}
 # Only HOME is taken from the hook's own environment: Claude Code runs each Bash
 # command in a fresh shell initialised from the user's profile, which the hook
 # process never loads, so any other variable may hold a different value there.
@@ -289,9 +297,13 @@ def _split_redirections(words: list) -> tuple:
             i += 2
             continue
         if w == "<":
+            if not nxt:
+                raise _Undecidable("< without a target")
             inputs.append(nxt)
             i += 2
             continue
+        if "<" in w and not w.strip("<>&"):  # `<>` opens read-write, others unmodelled
+            raise _Undecidable(w)
         clean.append(w)
         i += 1
     return clean, inputs
@@ -345,12 +357,14 @@ def _decide(cmd_str: str, root: Path) -> bool:
         # $D in this command still expands to the OLD value, so env is untouched.
         words, inputs = _split_redirections(words)
         if not words:
+            if inputs:  # `< file` alone still opens the file
+                raise _Undecidable("redirection without a command")
             continue
         name = words[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
         args = words[1:]
 
         if name == "cd":
-            if from_pipe or after in ("|", "||") or len(args) > 1:
+            if from_pipe or after in ("|", "||") or len(args) > 1 or inputs:
                 raise _Undecidable("cd")
             dest = _expand(args[0], env) if args else _expand("~", env)
             if dest == "-":
@@ -387,8 +401,16 @@ def _decide(cmd_str: str, root: Path) -> bool:
         # reading project code counts as touching the project, whether or not a
         # later search consumes it through the pipe; `< file` is a read for all
         operands = inputs if name in _NON_READERS else args + inputs
+        shorts, longs = _NON_READER_UNSAFE.get(name, ("", ()))
         for a in args:  # still refuse what the gate cannot expand
-            _expand(a, env)
+            a = _expand(a, env)
+            opt = a.split("=", 1)[0]
+            if (opt.startswith("--") and len(opt) > 2
+                    and any(lo.startswith(opt) for lo in longs)):
+                raise _Undecidable(f"{name} {opt}")
+            if (a.startswith("-") and not a.startswith("--")
+                    and any(c in a[1:] for c in shorts)):
+                raise _Undecidable(f"{name} {a}")
         read = [k for k in (_classify(_expand(a, env), cwd, root, target=False)
                             for a in operands if not a.startswith("-")) if k]
         if not read and name in _READS_CWD_WITHOUT_OPERAND:
