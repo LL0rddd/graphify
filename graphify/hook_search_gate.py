@@ -153,7 +153,8 @@ _NUMBER_RE = re.compile(r"^[-+]?[0-9]+(\.[0-9]+)?$")
 # `$` that starts no expansion (`grep 'foo$'`): bash keeps it literal. Allow-list
 # of what may follow, because shlex already dropped the quotes of `$'\x2dv'` and
 # `$"..."`, and `$[...]` is arithmetic expansion.
-_LITERAL_DOLLAR_RE = re.compile(r"\$(?=$|[/.,:=+%^\])}|~ ])")
+# zsh's `$=O` (split), `$^O`, `$~O` (glob) and `$+O` expand, so `= ^ ~ +` are out.
+_LITERAL_DOLLAR_RE = re.compile(r"\$(?=$|[/.,:%\])}| ])")
 # Only HOME is taken from the hook's own environment: Claude Code runs each Bash
 # command in a fresh shell initialised from the user's profile, which the hook
 # process never loads, so any other variable may hold a different value there.
@@ -203,7 +204,8 @@ def _pattern_glob_is_safe(tok: str, cwd: Path) -> bool:
     if os.path.isabs(tok):
         full, prefix = tok, ""
     else:
-        full, prefix = str(cwd / tok), os.path.join(str(cwd), "")
+        prefix = os.path.join(str(cwd), "")
+        full = prefix + tok  # keeps a leading `./`, which the shell's word keeps too
     matches = [m for _, m in zip(range(2), _glob.iglob(full))]
     # the word the shell produces is the match as written: `*/abs/x` may become `-f/abs/x`
     return len(matches) < 2 and not any(m[len(prefix):].startswith("-") for m in matches)
@@ -233,11 +235,13 @@ def _expand(tok: str, env: dict) -> str:
 
 def _kind(p: Path, root: Path) -> str:
     resolved = p.resolve()  # its own errors propagate: only relative_to means 'out'
-    try:
-        resolved.relative_to(root)
-    except ValueError:
-        return "out"
-    return "in"
+    for inner, outer in ((resolved, root), (root, resolved)):
+        try:  # inside the project, or an ancestor a recursive search walks through
+            inner.relative_to(outer)
+            return "in"
+        except ValueError:
+            pass
+    return "out"
 
 
 def _classify(tok: str, cwd: Path, root: Path, *, target: bool) -> str | None:
@@ -252,7 +256,7 @@ def _classify(tok: str, cwd: Path, root: Path, *, target: bool) -> str | None:
         return None
     if "{" in tok or "}" in tok:
         raise _Undecidable(tok)
-    full = tok if os.path.isabs(tok) else str(cwd / tok)
+    full = tok if os.path.isabs(tok) else os.path.join(str(cwd), "") + tok
     if _GLOB_RE.search(tok):
         if "**" in tok:  # recursive in zsh (and bash globstar), not in plain glob
             raise _Undecidable(tok)
@@ -367,10 +371,36 @@ def _split_redirections(words: list) -> tuple:
     return clean, inputs
 
 
+def _has_dollar_quoting(s: str) -> bool:
+    """`$'..'` / `$".."` (quotes that shlex drops, e.g. `$'\\x2dv'` is `-v`) or
+    `$[..]` (arithmetic) outside single quotes. `grep 'foo$'` is not one."""
+    quote, i = None, 0
+    while i < len(s):
+        c, nxt = s[i], s[i + 1:i + 2]
+        if quote == "'":
+            if c == "'":
+                quote = None
+        elif c == "\\":
+            i += 1
+        elif quote == '"':
+            if c == '"':
+                quote = None
+            elif c == "$" and nxt == "[":
+                return True
+        elif c in "'\"":
+            quote = c
+        elif c == "$" and nxt in ("'", '"', "["):
+            return True
+        i += 1
+    return False
+
+
 def _segments(cmd_str: str) -> list:
     """[(words, separator_before, separator_after)] of a simple command list."""
     if any(s in cmd_str for s in ("$(", "`", "<<", "<(", ">(")):
         raise _Undecidable("substitution or heredoc")
+    if _has_dollar_quoting(cmd_str):
+        raise _Undecidable("$'..', $\"..\" or $[..]")
     toks: list = []
     for line in cmd_str.replace("\\\n", " ").split("\n"):
         lex = shlex.shlex(line, posix=True, punctuation_chars=True)
@@ -407,7 +437,11 @@ def _decide(cmd_str: str, root: Path) -> bool:
         while words and _ASSIGN_RE.match(words[0]):
             assigns.append(_ASSIGN_RE.match(words[0]).groups())
             words = words[1:]
+        # after `&&`/`||` it may be skipped; in a pipeline it runs in a subshell
+        conditional = before in ("&&", "||") or from_pipe or after == "|"
         if not words:  # standalone assignment: sets shell variables
+            if conditional:
+                raise _Undecidable("conditional or piped assignment")
             for key, val in assigns:
                 env[key] = _expand(val, env)
             continue
@@ -425,13 +459,15 @@ def _decide(cmd_str: str, root: Path) -> bool:
         inputs = [_expand_word(a, env) for a in inputs]
 
         if name == "cd":
-            if from_pipe or after in ("|", "||") or len(args) > 1 or inputs:
+            if conditional or after == "||" or len(args) > 1 or inputs:
                 raise _Undecidable("cd")
             dest = args[0] if args else _expand("~", env)
             if dest == "-":
                 raise _Undecidable("cd -")
             if not os.path.isabs(dest) and (env.get("CDPATH") or os.environ.get("CDPATH")):
                 raise _Undecidable("CDPATH")
+            if ".." in Path(dest).parts:  # the shell's cd is logical, Path.resolve physical
+                raise _Undecidable("cd ..")
             new = Path(dest) if os.path.isabs(dest) else cwd / dest
             if not new.is_dir():  # cd would fail: the next command runs in the old cwd
                 raise _Undecidable("cd to a missing dir")
@@ -465,6 +501,9 @@ def _decide(cmd_str: str, root: Path) -> bool:
         # reading project code counts as touching the project, whether or not a
         # later search consumes it through the pipe; `< file` is a read for all
         operands = inputs if name in _NON_READERS else args + inputs
+        if name in _NON_READER_UNSAFE and any(
+                _GLOB_RE.search(a) or "{" in a for a in args):
+            raise _Undecidable(f"{name} glob")  # `printf -[u-w]` may become `-v`
         shorts, longs = _NON_READER_UNSAFE.get(name, ("", ()))
         if name in ("test", "[") and not any("[" in a for a in args):
             shorts = ""  # `test -v NAME` only checks; `-v 'a[D=0]'` evaluates the subscript

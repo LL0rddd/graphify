@@ -96,6 +96,7 @@ def _bash(command):
     "stat -f %z app/models.py; grep foo {E}/README.md",
     'S={E}; grep foo "$S/README.md"',                   # variable value without spaces
     "grep 'foo$' {E}/README.md",                        # a `$` that starts no expansion
+    'grep "foo$" {E}/README.md',
     "rg 'foo.*bar' {E}/README.md",                      # glob chars matching no file
     "printf '%d\\n' 1; grep foo {E}/README.md",          # numeric conversion, plain number
     "printf '%b' 'hi\\n'; grep foo {E}/README.md",
@@ -220,6 +221,20 @@ def test_grep_tool_with_out_of_project_path_is_quiet(layout, monkeypatch):
     "D={E}/README.md; printf $'\\x2dv' D app/models.py; grep foo \"$D\"",
     "D={E}/README.md; echo $[D=0]; grep foo \"$D\"",
     "grep a*/**/models.py {E}/README.md",
+    # 10th review: zsh `$=O`/`$~O` expand (and `$=` alone vanishes); conditional
+    # or piped assignments; a glob that may turn into printf's -v
+    "O=-r; grep $=O {E}/README.md",
+    "O=-r; grep $~O {E}/README.md",
+    "grep -r $= {E}/README.md",
+    'D=app/models.py; true || D={E}/README.md; grep foo "$D"',
+    'D=app/models.py; D={E}/README.md | true; grep foo "$D"',
+    'D={E}/README.md; printf -[u-w] D app/models.py; grep foo "$D"',
+    "false && cd {E}; grep -rn foo .",                # cd may be skipped
+    # a recursive search over an ANCESTOR of the project walks through it
+    "grep -rn foo {P}/..",
+    "rg foo /",
+    "find {P}/.. -name models.py",
+    "cd {E}; rg foo ..",
 ])
 def test_search_that_can_touch_the_project_nudges(template, layout, monkeypatch):
     project, elsewhere = layout
@@ -236,6 +251,17 @@ def test_glob_word_that_becomes_an_option_nudges(layout, monkeypatch):
     (project / ("-f" + str(target.parent))).mkdir(parents=True)
     (project / ("-f" + str(target.parent)) / "models.py").write_text("", encoding="utf-8")
     command = f"grep *{target} {elsewhere}/README.md"
+    assert "graphify query" in _invoke(_bash(command), project, monkeypatch), command
+
+
+def test_logical_cd_dotdot_through_symlink_nudges(layout, monkeypatch):
+    """The shell's `cd ..` is logical: from base/link (-> elsewhere/deep) it goes
+    to base, which holds the project; Path.resolve() would land in elsewhere."""
+    project, elsewhere = layout
+    (elsewhere / "deep").mkdir()
+    link = project.parent / "link_3882"
+    link.symlink_to(elsewhere / "deep")
+    command = f"cd {link}; cd ..; grep -rn foo ."
     assert "graphify query" in _invoke(_bash(command), project, monkeypatch), command
 
 
