@@ -132,13 +132,26 @@ _NON_READERS = frozenset({
 })
 _READ_ONLY = _FILE_READERS | _NON_READERS
 # ...except these options, which read a file (GNU `date -f`, GNU `du -X`/
-# `--exclude-from`/`--files0-from`) or assign a shell variable (bash `printf -v`).
+# `--exclude-from`/`--files0-from`) or assign a shell variable (bash `printf -v`,
+# zsh `stat -A`/`-H`, bash `test -v 'a[D=0]'` via subscript arithmetic).
 # Long options match by prefix, as GNU getopt accepts abbreviations.
 _NON_READER_UNSAFE = {
     "date": ("f", ("--file",)),
     "du": ("X", ("--exclude-from", "--files0-from")),
     "printf": ("v", ()),
+    "stat": ("AH", ()),
+    "test": ("v", ()),
+    "[": ("v", ()),
 }
+# printf formats the gate accepts: text conversions and %%; `%n` assigns a
+# variable, and numeric conversions and `*` widths evaluate their argument
+# arithmetically in zsh (`printf '%d' 'D=0'` assigns D), so those need plain numbers.
+_PRINTF_CONV_RE = re.compile(r"%[-+ #0-9.*]*(.?)")
+_PRINTF_TEXT = frozenset("sbcq")
+_PRINTF_NUMERIC = frozenset("diouxXeEfFgGaA")
+_NUMBER_RE = re.compile(r"^[-+]?[0-9]+(\.[0-9]+)?$")
+# `$` that starts no expansion (`grep 'foo$'`): bash keeps it literal.
+_LITERAL_DOLLAR_RE = re.compile(r"\$(?![A-Za-z0-9_{@*#?!$'\"(-])")
 # Only HOME is taken from the hook's own environment: Claude Code runs each Bash
 # command in a fresh shell initialised from the user's profile, which the hook
 # process never loads, so any other variable may hold a different value there.
@@ -150,6 +163,42 @@ _OUTPUT_REDIRECTIONS = frozenset({">", ">>", ">|", "&>", "&>>", ">&", "<&"})
 _ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 _VAR_RE = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
 _GLOB_RE = re.compile(r"[*?\[]")
+
+
+def _expand_word(tok: str, env: dict) -> str:
+    """_expand for a command word. shlex drops the quotes, so an unquoted `$O`
+    cannot be told from `"$O"`: a variable whose value holds whitespace (or any
+    variable once IFS is reassigned) may split into several arguments."""
+    out = _expand(tok, env)
+    if _VAR_RE.search(tok) and (
+            "IFS" in env or out == "" or any(c.isspace() for c in out)):
+        raise _Undecidable(f"word splitting: {tok}")  # an empty value vanishes too
+    return out
+
+
+def _printf_format_is_safe(args: list) -> bool:
+    rest = args[1:] if args[:1] == ["--"] else args
+    fmt, values = (rest[0], rest[1:]) if rest else ("", [])
+    numeric = False
+    for m in _PRINTF_CONV_RE.finditer(fmt.replace("%%", "")):
+        conv = m.group(1)
+        numeric |= "*" in m.group(0) or conv in _PRINTF_NUMERIC
+        if conv not in _PRINTF_TEXT and conv not in _PRINTF_NUMERIC:
+            return False
+    # numeric arguments are evaluated arithmetically in zsh: only plain numbers
+    return not numeric or all(_NUMBER_RE.match(v) for v in values)
+
+
+def _pattern_glob_is_safe(tok: str, cwd: Path) -> bool:
+    """A pattern or option value the shell may glob (quotes are gone): it must not
+    turn into extra operands. Braces with `,`/`..` always may."""
+    if "{" in tok and ("," in tok or ".." in tok):
+        return False
+    if not _GLOB_RE.search(tok):
+        return True
+    full = tok if os.path.isabs(tok) else str(cwd / tok)
+    matches = [m for _, m in zip(range(2), _glob.iglob(full))]
+    return len(matches) < 2 and not any(Path(m).name.startswith("-") for m in matches)
 
 
 def _expand(tok: str, env: dict) -> str:
@@ -164,7 +213,7 @@ def _expand(tok: str, env: dict) -> str:
             raise _Undecidable(m.group(0))
         return v
     out = _VAR_RE.sub(_sub, tok)
-    if "$" in out:  # $1, $@, $?, ${VAR:-x} ...: not modelled
+    if "$" in _LITERAL_DOLLAR_RE.sub("", out):  # $1, $@, $?, ${VAR:-x} ...: not modelled
         raise _Undecidable(tok)
     if out == "~" or out.startswith("~/"):
         home = env.get("HOME", os.environ.get("HOME"))  # HOME may be reassigned
@@ -361,12 +410,15 @@ def _decide(cmd_str: str, root: Path) -> bool:
                 raise _Undecidable("redirection without a command")
             continue
         name = words[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
-        args = words[1:]
+        # expand every word BEFORE telling options, patterns and operands apart:
+        # `O=-r; grep $O /x` is `grep -r /x` to the shell
+        args = [_expand_word(a, env) for a in words[1:]]
+        inputs = [_expand_word(a, env) for a in inputs]
 
         if name == "cd":
             if from_pipe or after in ("|", "||") or len(args) > 1 or inputs:
                 raise _Undecidable("cd")
-            dest = _expand(args[0], env) if args else _expand("~", env)
+            dest = args[0] if args else _expand("~", env)
             if dest == "-":
                 raise _Undecidable("cd -")
             if not os.path.isabs(dest) and (env.get("CDPATH") or os.environ.get("CDPATH")):
@@ -382,9 +434,12 @@ def _decide(cmd_str: str, root: Path) -> bool:
                 targets, pattern_files = _find_roots(args), []
             else:
                 targets, pattern_files = _grep_like_operands(args, _TABLES[name])
+                for a in args:  # pattern / option values the shell may glob into operands
+                    if a not in targets and not _pattern_glob_is_safe(a, cwd):
+                        raise _Undecidable(f"glob in pattern: {a}")
             reads_stdin = "-" in targets or (not targets and name != "find")
             files = [t for t in targets if t != "-"] + inputs + pattern_files
-            kinds = [k for k in (_classify(_expand(t, env), cwd, root, target=True)
+            kinds = [k for k in (_classify(t, cwd, root, target=True)
                                  for t in files) if k]
             if reads_stdin and from_pipe:
                 kinds += pipe_kinds  # it also reads the upstream commands' output
@@ -402,8 +457,11 @@ def _decide(cmd_str: str, root: Path) -> bool:
         # later search consumes it through the pipe; `< file` is a read for all
         operands = inputs if name in _NON_READERS else args + inputs
         shorts, longs = _NON_READER_UNSAFE.get(name, ("", ()))
-        for a in args:  # still refuse what the gate cannot expand
-            a = _expand(a, env)
+        if name in ("test", "[") and not any("[" in a for a in args):
+            shorts = ""  # `test -v NAME` only checks; `-v 'a[D=0]'` evaluates the subscript
+        if name == "printf" and not _printf_format_is_safe(args):
+            raise _Undecidable("printf format")
+        for a in args:
             opt = a.split("=", 1)[0]
             if (opt.startswith("--") and len(opt) > 2
                     and any(lo.startswith(opt) for lo in longs)):
@@ -411,7 +469,7 @@ def _decide(cmd_str: str, root: Path) -> bool:
             if (a.startswith("-") and not a.startswith("--")
                     and any(c in a[1:] for c in shorts)):
                 raise _Undecidable(f"{name} {a}")
-        read = [k for k in (_classify(_expand(a, env), cwd, root, target=False)
+        read = [k for k in (_classify(a, cwd, root, target=False)
                             for a in operands if not a.startswith("-")) if k]
         if not read and name in _READS_CWD_WITHOUT_OPERAND:
             read = [_kind(cwd, root)]

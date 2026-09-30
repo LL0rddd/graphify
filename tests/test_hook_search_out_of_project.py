@@ -91,6 +91,15 @@ def _bash(command):
     "du -sh app; grep foo {E}/README.md",
     "date -u; grep foo {E}/README.md",                   # options that read nothing
     "printf '%s' x; grep foo {E}/README.md",
+    "printf '%-10s %%\\n' x; grep foo {E}/README.md",   # %s with flags/width, literal %%
+    "test -f app/models.py; grep foo {E}/README.md",   # test -f is metadata
+    "stat -f %z app/models.py; grep foo {E}/README.md",
+    'S={E}; grep foo "$S/README.md"',                   # variable value without spaces
+    "grep 'foo$' {E}/README.md",                        # a `$` that starts no expansion
+    "rg 'foo.*bar' {E}/README.md",                      # glob chars matching no file
+    "printf '%d\\n' 1; grep foo {E}/README.md",          # numeric conversion, plain number
+    "printf '%b' 'hi\\n'; grep foo {E}/README.md",
+    "test -v HOME; grep foo {E}/README.md",             # -v on a plain name only checks
 ])
 def test_out_of_project_search_is_quiet(template, layout, monkeypatch):
     project, elsewhere = layout
@@ -179,6 +188,33 @@ def test_grep_tool_with_out_of_project_path_is_quiet(layout, monkeypatch):
     "du --exclude-f=app/models.py {E}; grep foo {E}/README.md",  # abbreviated long option
     "date -f app/models.py; grep foo {E}/README.md",     # GNU date reads dates from a file
     'D={E}/README.md; printf -v D app/models.py; grep foo "$D"',  # printf -v assigns
+    # word splitting: shlex drops quotes, so a value with spaces may be several args
+    "O=' -X'; du $O app/models.py; grep foo {E}/README.md",
+    "O='--summarize -X'; du $O app/models.py; grep foo {E}/README.md",
+    "O=' -f'; date $O app/models.py; grep foo {E}/README.md",
+    'D={E}/README.md; O=" -v"; printf $O D app/models.py; grep foo "$D"',
+    "O='{E}/README.md app/models.py'; grep foo $O",
+    "IFS=/; O=x; grep foo {E}/README.md $O",           # reassigned IFS
+    # printf conversions that assign (%n) or evaluate arithmetic (zsh %d, * width)
+    'D={E}/README.md; printf "%n" D; grep foo "$D"',
+    "D={E}/README.md; printf '%d' 'D=0'; grep foo \"$D\"",
+    "D={E}/README.md; printf '%*s' 'D=0' x; grep foo \"$D\"",
+    # zsh stat -A/-H and bash test -v 'a[...]' assign variables
+    'D={E}/README.md; stat -A D +size /dev/null; grep foo "$D"',
+    "a=x; D={E}/README.md; test -v 'a[D=0]'; grep foo \"$D\"",
+    "a=x; D={E}/README.md; [ -v 'a[D=0]' ]; grep foo \"$D\"",
+    # variables expanded before options/pattern/operands are told apart
+    "O=-r; grep $O {E}/README.md",                    # grep -r: the path is the pattern
+    "O='--files app'; rg $O {E}/README.md",
+    "O='x app/models.py'; grep -e $O {E}/README.md",
+    "O='x -o -exec head -n 1 app/models.py ;'; find {E} -name $O",
+    "O=; rg $O {E}/README.md",                        # empty value vanishes: path = pattern
+    "cd {E}; D=; cd $D; rg -l x .",                   # `cd` with no argument goes HOME
+    'F=; D={E}/README.md; printf $F "%n" D; grep foo "$D"',
+    # a pattern the shell may glob into extra operands (quotes are invisible)
+    "O='*'; rg $O {E}/README.md",
+    "rg * {E}/README.md",
+    "grep -e {{x,app/models.py}} {E}/README.md",      # brace expansion
 ])
 def test_search_that_can_touch_the_project_nudges(template, layout, monkeypatch):
     project, elsewhere = layout
