@@ -150,8 +150,10 @@ _PRINTF_CONV_RE = re.compile(r"%[-+ #0-9.*]*(.?)")
 _PRINTF_TEXT = frozenset("sbcq")
 _PRINTF_NUMERIC = frozenset("diouxXeEfFgGaA")
 _NUMBER_RE = re.compile(r"^[-+]?[0-9]+(\.[0-9]+)?$")
-# `$` that starts no expansion (`grep 'foo$'`): bash keeps it literal.
-_LITERAL_DOLLAR_RE = re.compile(r"\$(?![A-Za-z0-9_{@*#?!$'\"(-])")
+# `$` that starts no expansion (`grep 'foo$'`): bash keeps it literal. Allow-list
+# of what may follow, because shlex already dropped the quotes of `$'\x2dv'` and
+# `$"..."`, and `$[...]` is arithmetic expansion.
+_LITERAL_DOLLAR_RE = re.compile(r"\$(?=$|[/.,:=+%^\])}|~ ])")
 # Only HOME is taken from the hook's own environment: Claude Code runs each Bash
 # command in a fresh shell initialised from the user's profile, which the hook
 # process never loads, so any other variable may hold a different value there.
@@ -196,9 +198,15 @@ def _pattern_glob_is_safe(tok: str, cwd: Path) -> bool:
         return False
     if not _GLOB_RE.search(tok):
         return True
-    full = tok if os.path.isabs(tok) else str(cwd / tok)
+    if "**" in tok:  # recursive in zsh (and bash globstar): plain glob undercounts
+        return False
+    if os.path.isabs(tok):
+        full, prefix = tok, ""
+    else:
+        full, prefix = str(cwd / tok), os.path.join(str(cwd), "")
     matches = [m for _, m in zip(range(2), _glob.iglob(full))]
-    return len(matches) < 2 and not any(Path(m).name.startswith("-") for m in matches)
+    # the word the shell produces is the match as written: `*/abs/x` may become `-f/abs/x`
+    return len(matches) < 2 and not any(m[len(prefix):].startswith("-") for m in matches)
 
 
 def _expand(tok: str, env: dict) -> str:
@@ -249,9 +257,10 @@ def _classify(tok: str, cwd: Path, root: Path, *, target: bool) -> str | None:
         if "**" in tok:  # recursive in zsh (and bash globstar), not in plain glob
             raise _Undecidable(tok)
         kinds = set()
+        prefix = "" if os.path.isabs(tok) else os.path.join(str(cwd), "")
         for n, match in enumerate(_glob.iglob(full)):
-            if n >= _GLOB_LIMIT:
-                raise _Undecidable(tok)
+            if n >= _GLOB_LIMIT or match[len(prefix):].startswith("-"):
+                raise _Undecidable(tok)  # too many, or the word becomes an option
             kinds.add(_kind(Path(match), root))
         if not kinds:
             if target:

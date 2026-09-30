@@ -215,12 +215,28 @@ def test_grep_tool_with_out_of_project_path_is_quiet(layout, monkeypatch):
     "O='*'; rg $O {E}/README.md",
     "rg * {E}/README.md",
     "grep -e {{x,app/models.py}} {E}/README.md",      # brace expansion
+    # 9th review: `$'\x2dv'` is `-v` (shlex already dropped the quotes); `$[...]`
+    # is arithmetic; `**` in a pattern (zsh); a glob word that becomes an option
+    "D={E}/README.md; printf $'\\x2dv' D app/models.py; grep foo \"$D\"",
+    "D={E}/README.md; echo $[D=0]; grep foo \"$D\"",
+    "grep a*/**/models.py {E}/README.md",
 ])
 def test_search_that_can_touch_the_project_nudges(template, layout, monkeypatch):
     project, elsewhere = layout
     command = template.format(E=elsewhere, P=project)
     out = _invoke(_bash(command), project, monkeypatch)
     assert "graphify query" in out, command
+
+
+def test_glob_word_that_becomes_an_option_nudges(layout, monkeypatch):
+    """`grep */abs/models.py /x` expands to `grep -f/abs/models.py /x` when a
+    directory named `-f<abs>` exists: the project file becomes grep's pattern file."""
+    project, elsewhere = layout
+    target = project / "app" / "models.py"
+    (project / ("-f" + str(target.parent))).mkdir(parents=True)
+    (project / ("-f" + str(target.parent)) / "models.py").write_text("", encoding="utf-8")
+    command = f"grep *{target} {elsewhere}/README.md"
+    assert "graphify query" in _invoke(_bash(command), project, monkeypatch), command
 
 
 def test_process_env_variable_is_not_trusted(layout, monkeypatch):
