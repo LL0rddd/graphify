@@ -6,13 +6,14 @@ existed - `grep -n foo /some/other/repo/file`, `grep x /etc/hosts`, or the Grep 
 with an absolute `path` elsewhere all got the MANDATORY nudge, although nothing
 searched belongs to the graph.
 
-The fix (graphify/hook_search_gate.py) is an allow-list: it goes quiet only when
-every search in the command provably targets paths outside the project root AND
-the command has a shape the gate fully models. The second half of this file pins
-the false-silence traps found while designing it - a whole-command path scan and a
-deny-list both silenced real project searches (`grep x /tmp/a; rg y`,
-`rg y > /tmp/out`, `rg --files`, unknown options, `find -exec`, background or
-failed `cd`, `$1`, `${VAR:-x}`, symlink-following traversal).
+The fix (graphify/hook_search_gate.py) is a strict allow-list: it goes quiet only
+for `[cd ABS_DIR &&] SEARCH [| FILTER...]` written with literal words, when every
+searched path is outside the project root. The second half of this file pins the
+false-silence traps found over eleven review rounds of broader designs (a
+whole-command path scan, a deny-list, then a shell model): `grep x /tmp/a; rg y`,
+`rg --files`, `find -exec`, conditional `cd`, variables and word splitting, globs
+that become options, zsh `$=O`, `$'..'`, searches over an ancestor directory...
+They all keep nudging; so do outside searches the strict shape does not cover.
 """
 import io
 import json
@@ -68,44 +69,54 @@ def _bash(command):
     "grep -n foo {E}/README.md",
     "grep -rn foo {E}",
     "rg foo {E}",
-    "S={E}; grep -n foo $S/README.md",
     "grep -e foo {E}/README.md",
     'rg foo "{E}"',
     "find {E} -name '*.md'",
     "find {E} -type f -name '*.md' -print",
-    "cat {E}/README.md | grep foo",
-    "date; grep foo {E}/README.md",          # external command: no shell state change
     "cd {E} && grep -rn foo .",
-    "cd {E}; grep -rn foo .",
     'grep -rn "/api/v1" {E}',
     "grep -rne foo {E}",                    # -e at the end of a cluster takes the pattern
     "grep -m 5 foo {E}/README.md",          # valued option
     "rg -E utf-8 foo {E}",                  # rg -E takes a value (encoding)
     "rg --color never foo {E}",             # rg --color takes a value
     "grep --color=auto foo {E}/README.md",  # grep --color takes it only with =
-    "grep foo {E}/*.md",                    # glob expanded; every match is outside
     "find {E} -newer app/models.py -name x",  # -newer reads metadata only
-    "echo hi | grep h {E}/README.md",       # echo reads no file
-    "ls {E} | grep READ",                   # lists an outside directory
-    "stat app/models.py; grep foo {E}/README.md",  # metadata only, like find -newer
-    "du -sh app; grep foo {E}/README.md",
-    "date -u; grep foo {E}/README.md",                   # options that read nothing
-    "printf '%s' x; grep foo {E}/README.md",
-    "printf '%-10s %%\\n' x; grep foo {E}/README.md",   # %s with flags/width, literal %%
-    "test -f app/models.py; grep foo {E}/README.md",   # test -f is metadata
-    "stat -f %z app/models.py; grep foo {E}/README.md",
-    'S={E}; grep foo "$S/README.md"',                   # variable value without spaces
-    "grep 'foo$' {E}/README.md",                        # a `$` that starts no expansion
+    "grep 'foo$' {E}/README.md",            # quoted: a regex anchor, not an expansion
     'grep "foo$" {E}/README.md',
-    "rg 'foo.*bar' {E}/README.md",                      # glob chars matching no file
-    "printf '%d\\n' 1; grep foo {E}/README.md",          # numeric conversion, plain number
-    "printf '%b' 'hi\\n'; grep foo {E}/README.md",
-    "test -v HOME; grep foo {E}/README.md",             # -v on a plain name only checks
+    "rg 'foo.*bar' {E}/README.md",          # quoted glob characters are literal
+    "rg -g '*.md' foo {E}",
+    "grep -rn foo {E} | head -20",          # pipe-only filters
+    "grep -rn foo {E} | sort | uniq -c | head -n 5",
+    "rg -l foo {E} | wc -l",
+    "grep -rn foo {E} 2>/dev/null",
+    "grep -rn foo {E} 2>&1 | head",
+    "rg foo ~/README.md",                   # HOME points at elsewhere in this test
 ])
 def test_out_of_project_search_is_quiet(template, layout, monkeypatch):
     project, elsewhere = layout
+    monkeypatch.setenv("HOME", str(elsewhere))
     command = template.format(E=elsewhere)
     assert _invoke(_bash(command), project, monkeypatch).strip() == "", command
+
+
+@pytest.mark.parametrize("template", [
+    "S={E}; grep -n foo $S/README.md",      # variables
+    'S={E}; grep foo "$S/README.md"',
+    "cat {E}/README.md | grep foo",         # the search is not the first stage
+    "ls {E} | grep READ",
+    "echo hi | grep h {E}/README.md",
+    "date; grep foo {E}/README.md",         # more than one command
+    "cd {E}; grep -rn foo .",
+    "grep foo {E}/*.md",                    # unquoted glob
+    "grep -rn foo {E} | tee /tmp/x",        # a pipe stage that is not a filter
+    "grep -rn foo {E} > /tmp/out",          # output redirection
+])
+def test_outside_search_outside_the_strict_shape_still_nudges(template, layout, monkeypatch):
+    """Deliberate trade-off: these only touch outside paths, but the strict shape
+    does not cover them, so they keep the nudge (a false nudge, never a false silence)."""
+    project, elsewhere = layout
+    command = template.format(E=elsewhere)
+    assert "graphify query" in _invoke(_bash(command), project, monkeypatch), command
 
 
 def test_grep_tool_with_out_of_project_path_is_quiet(layout, monkeypatch):
@@ -235,6 +246,16 @@ def test_grep_tool_with_out_of_project_path_is_quiet(layout, monkeypatch):
     "rg foo /",
     "find {P}/.. -name models.py",
     "cd {E}; rg foo ..",
+    # 11th review: a newline after &&/|| keeps the condition; a quote in a comment;
+    # an assignment with a redirection; a single-quoted `$D`
+    'D=app/models.py; true ||\nD={E}/README.md; grep foo "$D"',
+    "false &&\ncd {E}; grep -r foo .",
+    "grep foo {E}/README.md\n# don't\nr=efoo; grep -$'r' {E}/README.md",
+    'D={E}/README.md; D=app/models.py 2>&1; grep foo "$D"',
+    "D={E}/README.md; grep foo '$D'",
+    "grep -rn foo {P}/.. | head",
+    "cd {E} && cd {P} && grep -rn foo .",
+    "cd {E}/.. && grep -rn foo .",                    # `..` in the cd target
 ])
 def test_search_that_can_touch_the_project_nudges(template, layout, monkeypatch):
     project, elsewhere = layout
@@ -282,6 +303,28 @@ def test_grep_tool_in_project_nudges(tool_input, layout, monkeypatch):
     project, _ = layout
     out = _invoke({"tool_input": tool_input}, project, monkeypatch)
     assert "graphify query" in out, tool_input
+
+
+@pytest.mark.parametrize("path_fn", [
+    lambda P, E: str(P.parent),             # an ancestor: the search walks the project
+    lambda P, E: "/",
+    lambda P, E: str(E / "missing_3882"),   # does not exist: undecidable
+])
+def test_grep_tool_ancestor_or_missing_path_nudges(path_fn, layout, monkeypatch):
+    project, elsewhere = layout
+    payload = {"tool_input": {"pattern": "foo", "path": path_fn(project, elsewhere)}}
+    assert "graphify query" in _invoke(payload, project, monkeypatch)
+
+
+def test_project_spelled_differently_is_still_the_project(layout, monkeypatch):
+    """Compared by file identity: on a case-insensitive volume `/PROJECT` is the
+    project (the same holds for macOS firmlinks like /System/Volumes/Data/...)."""
+    project, _ = layout
+    upper = str(project.parent / project.name.upper())
+    if not os.path.exists(upper):
+        pytest.skip("case-sensitive filesystem")
+    out = _invoke(_bash(f"grep -rn foo {upper}/app"), project, monkeypatch)
+    assert "graphify query" in out
 
 
 def test_grep_tool_absolute_path_inside_project_nudges(layout, monkeypatch):
