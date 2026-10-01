@@ -91,6 +91,10 @@ def _bash(command):
     "grep -rn foo {E} 2>/dev/null",
     "grep -rn foo {E} 2>&1 | head",
     "rg foo ~/README.md",                   # HOME points at elsewhere in this test
+    "grep -rn foo {E} | head -n 20 | tail -5",
+    "grep -rn foo {E} | sort -rn | uniq -c",
+    "grep -rn foo {E} | cut -d: -f1",
+    "rg --no-config foo {E}",
 ])
 def test_out_of_project_search_is_quiet(template, layout, monkeypatch):
     project, elsewhere = layout
@@ -256,12 +260,45 @@ def test_grep_tool_with_out_of_project_path_is_quiet(layout, monkeypatch):
     "grep -rn foo {P}/.. | head",
     "cd {E} && cd {P} && grep -rn foo .",
     "cd {E}/.. && grep -rn foo .",                    # `..` in the cd target
+    # 12th review: zsh EXTENDED_GLOB `^`, zsh `=cmd`; filters that open or write
+    # files; a quoted `|` is a word; NBSP is not a word separator for the shells
+    "grep -l ^foo {E}/README.md",
+    "grep x =ls {E}/README.md",
+    # (cd into app/ so the project file has no `/`, which the old regex refused)
+    "cd {P}/app && grep x {E}/README.md | sort --files0-from=models.py",
+    "cd {P}/app && grep x {E}/README.md | sort -R --random-source=models.py",
+    "cd {P}/app && grep x {E}/README.md | sort -nomodels.py",   # -n -o models.py
+    "cd {P}/app && grep x {E}/README.md | sort -T.",
+    "cd {P}/app && grep x {E}/README.md | head 1",              # reads a file named 1
+    "cd {P}/app && grep x {E}/README.md | uniq 1 2",
+    "grep x {E}/README.md | wc --files0-from=-",
+    "cd {P}/app && grep x {E}/README.md '|' head -fmodels.py",  # one grep, -f models.py
+    "grep -lv {E}/README.md -e app/models.py {E}/README.md",
 ])
 def test_search_that_can_touch_the_project_nudges(template, layout, monkeypatch):
     project, elsewhere = layout
     command = template.format(E=elsewhere, P=project)
     out = _invoke(_bash(command), project, monkeypatch)
     assert "graphify query" in out, command
+
+
+def test_hardlink_to_a_project_file_nudges(layout, monkeypatch):
+    """An outside path may be a hard link to a project file: same content."""
+    project, elsewhere = layout
+    link = elsewhere / "models_link.py"
+    os.link(project / "app" / "models.py", link)
+    assert "graphify query" in _invoke(_bash(f"grep x {link}"), project, monkeypatch)
+
+
+def test_ripgrep_config_needs_no_config(layout, monkeypatch):
+    """RIPGREP_CONFIG_PATH may add --file/--follow/--pre to every rg call."""
+    project, elsewhere = layout
+    cfg = elsewhere / "rgrc"
+    cfg.write_text("--follow\n", encoding="utf-8")
+    monkeypatch.setenv("RIPGREP_CONFIG_PATH", str(cfg))
+    assert "graphify query" in _invoke(_bash(f"rg foo {elsewhere}"), project, monkeypatch)
+    out = _invoke(_bash(f"rg --no-config foo {elsewhere}"), project, monkeypatch)
+    assert out.strip() == ""
 
 
 def test_glob_word_that_becomes_an_option_nudges(layout, monkeypatch):
