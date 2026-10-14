@@ -1076,6 +1076,20 @@ def _is_shebang_allowlist_fix_line(line: str) -> bool:
     return "[!a-zA-Z0-9/_." in line
 
 
+def _is_shebang_args_fix_line(line: str) -> bool:
+    """Whether a line is part of the shebang-with-arguments interpreter fix.
+
+    The interpreter probe read the shebang with ``tr -d '#!'``, which keeps any
+    interpreter arguments: pipx writes ``#!/.../venvs/graphifyy/bin/python -E``, so
+    the value carried `` -E``, failed the allowlist guard and detection fell through
+    to a bare ``python3`` that lacked graphify (the skill then pip-installed the
+    upstream package into it). The probe now keeps only the first word of the
+    shebang (``sed 's/^#! *//' | cut -d' ' -f1``). Both the old (removed) and new
+    (added) forms match here.
+    """
+    return 'head -1 "$GRAPHIFY_BIN"' in line and ("tr -d '#!'" in line or "cut -d' ' -f1" in line)
+
+
 def _is_obsidian_usage_comment_line(line: str) -> bool:
     """Whether a line is part of the ``/graphify`` usage-comment fix (#1681).
 
@@ -1159,6 +1173,7 @@ _SANCTIONED_MONOLITH_DIFFS = (
     _is_sensitive_reporting_fix_line,
     _is_no_api_key_fix_line,
     _is_shebang_allowlist_fix_line,
+    _is_shebang_args_fix_line,
     _is_obsidian_usage_comment_line,
     _is_uv_from_interpreter_fix_line,
     _is_semantic_cache_scope_fix_line,
