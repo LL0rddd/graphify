@@ -1115,3 +1115,44 @@ def test_windows_skill_writes_marker_files_without_a_bom():
         )
     assert "New-Object System.Text.UTF8Encoding $false" in core, \
         "the BOM-less encoding object must be constructed in the windows render"
+
+
+@pytest.mark.parametrize(
+    "shebang, expected",
+    [
+        ("#!/home/u/.local/pipx/venvs/graphifyy/bin/python -E", "/home/u/.local/pipx/venvs/graphifyy/bin/python"),
+        ("#!/usr/bin/python3", "/usr/bin/python3"),
+        ("#! /opt/py/bin/python3", "/opt/py/bin/python3"),
+        ("#!/usr/bin/env python3", "python3"),
+        ("#!/usr/bin/env -S python3 -E", "python3"),
+    ],
+)
+def test_shebang_probe_keeps_only_the_interpreter(tmp_path, shebang, expected):
+    """The probe drops '#!', a leading env (and its options) and interpreter args."""
+    import subprocess
+
+    exe = tmp_path / "graphify"
+    exe.write_text(shebang + "\n", encoding="utf-8")
+    out = subprocess.run(
+        ["/bin/sh", "-c", 'GRAPHIFY_BIN="$1"; printf %s ' + gen._SHEBANG_PROBE_NEW, "sh", str(exe)],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert out == expected
+
+
+def test_shebang_probe_predicate_is_exact():
+    """Only the exact old/new probe lines are sanctioned; any other edit is drift."""
+    assert gen._is_shebang_args_fix_line("    _SHEBANG=" + gen._SHEBANG_PROBE_OLD)
+    assert gen._is_shebang_args_fix_line("        PYTHON=" + gen._SHEBANG_PROBE_NEW)
+    assert not gen._is_shebang_args_fix_line(
+        """    _SHEBANG=$(head -1 "$GRAPHIFY_BIN" | cut -d' ' -f1); echo drift""")
+    assert not gen._is_shebang_args_fix_line(
+        """    _SHEBANG=$(head -1 "$GRAPHIFY_BIN" | sed 's/^#! *//' | cut -d' ' -f1)""")
+
+
+def test_every_rendered_shebang_probe_is_the_fixed_one():
+    """No generated skill keeps the old probe that leaked interpreter args."""
+    for f in sorted((REPO_ROOT / "graphify").glob("skill*.md")):
+        for line in f.read_text(encoding="utf-8").splitlines():
+            if 'head -1 "$GRAPHIFY_BIN"' in line:
+                assert gen._SHEBANG_PROBE_NEW in line, (f.name, line)

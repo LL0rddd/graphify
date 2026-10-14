@@ -1076,6 +1076,15 @@ def _is_shebang_allowlist_fix_line(line: str) -> bool:
     return "[!a-zA-Z0-9/_." in line
 
 
+_SHEBANG_PROBE_OLD = """$(head -1 "$GRAPHIFY_BIN" | tr -d '#!')"""
+_SHEBANG_PROBE_NEW = r"""$(head -1 "$GRAPHIFY_BIN" | sed -e 's/^#! *//' -e 's|^[^ ]*/env  *\(-[^ ]*  *\)*||' | cut -d' ' -f1)"""
+_SHEBANG_PROBE_LINES = frozenset(
+    "%s=%s" % (var, probe)
+    for var in ("_SHEBANG", "PYTHON")
+    for probe in (_SHEBANG_PROBE_OLD, _SHEBANG_PROBE_NEW)
+)
+
+
 def _is_shebang_args_fix_line(line: str) -> bool:
     """Whether a line is part of the shebang-with-arguments interpreter fix.
 
@@ -1083,11 +1092,13 @@ def _is_shebang_args_fix_line(line: str) -> bool:
     interpreter arguments: pipx writes ``#!/.../venvs/graphifyy/bin/python -E``, so
     the value carried `` -E``, failed the allowlist guard and detection fell through
     to a bare ``python3`` that lacked graphify (the skill then pip-installed the
-    upstream package into it). The probe now keeps only the first word of the
-    shebang (``sed 's/^#! *//' | cut -d' ' -f1``). Both the old (removed) and new
-    (added) forms match here.
+    upstream package into it). The probe now strips ``#!``, drops a leading
+    ``/.../env`` and its options (so ``#!/usr/bin/env python3`` yields ``python3``,
+    not ``/usr/bin/env``) and keeps the first remaining word. Only the exact old and
+    new probe lines (for ``_SHEBANG`` and ``PYTHON``, indentation aside) match, so
+    any other edit to these lines is still reported as drift.
     """
-    return 'head -1 "$GRAPHIFY_BIN"' in line and ("tr -d '#!'" in line or "cut -d' ' -f1" in line)
+    return line.strip() in _SHEBANG_PROBE_LINES
 
 
 def _is_obsidian_usage_comment_line(line: str) -> bool:
